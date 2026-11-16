@@ -21,10 +21,25 @@ fullnameOverride: ""
 
 # Immich proxy configuration
 config:
-  # The URL of the Immich server to proxy requests to
+  # Leave empty for standalone archive mode.
   immichServerURL: "http://immich-server:2283"
   # Address and port to listen on (inside container)
   listenAddr: ":8080"
+  dataDir: "/data"
+  maxUploadBytes: "107374182400"
+
+# Set secrets through extraEnv with valueFrom.secretKeyRef; do not commit credentials here.
+extraEnv: []
+
+# Keep originals and forwarding state on persistent storage.
+persistence:
+  enabled: true
+  existingClaim: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 100Gi
+  storageClass: ""
+  annotations: {}
 
 # This section builds out the service account more information can be found here: https://kubernetes.io/docs/concepts/security/service-accounts/
 serviceAccount:

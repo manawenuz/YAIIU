@@ -1,148 +1,78 @@
-# Immich Proxy Server
+# YAIIU Photo Server
 
-A proxy server that sits between iOS background upload extension and Immich server. It handles the conversion of raw photo data to the multipart/form-data format required by Immich API.
+This server lets YAIIU upload iPhone photos into a durable, self-hosted archive. Immich is optional. The server keeps the original upload on disk before it forwards a copy to Immich.
 
-## Background
+## Modes
 
-iOS 26.1 introduces `PHBackgroundResourceUploadExtension` which allows background photo uploads. However, when using `PHAssetResourceUploadJobChangeRequest.createJob`, the system replaces the `httpBody` with raw photo data, ignoring any multipart form-data structure you've set up.
+- **Standalone:** leave `IMMICH_SERVER_URL` empty. YAIIU signs in against the configured standalone email and password, and uploads are stored in `DATA_DIR`.
+- **With Immich:** set `IMMICH_SERVER_URL` to an Immich HTTP(S) origin. Login and normal Immich API calls pass through to Immich. Both YAIIU upload paths are archived first, then sent to Immich as a streamed multipart upload.
 
-This proxy server solves this problem by:
+If Immich is unavailable, the server keeps the original and returns an upload error so YAIIU can retry. A token hash from a successful Immich login or upload is stored in the archive directory for up to 30 days; this lets the server accept retries during an Immich outage without saving the bearer token itself. Set `IMMICH_API_KEY` to let the server retry and backfill archived uploads in the background. Create an Immich API key with asset upload permission for this purpose. Without it, forwarding resumes when YAIIU retries an upload with a valid session.
 
-1. Receiving raw photo data with metadata in headers/query parameters
-2. Converting it to the multipart/form-data format expected by Immich
-3. Forwarding the properly formatted request to the Immich server
+Standalone mode implements the login, current-user, and empty asset-sync endpoints YAIIU needs for photo uploads. It does not implement Immich's gallery, album, sharing, or search features. The archive itself can be browsed or downloaded through the read-only archive API below.
 
-## Architecture
+## Data layout and archive API
 
-```
-┌─────────────────┐     ┌───────────────┐     ┌──────────────┐
-│  iOS Device     │────▶│ Immich Proxy  │────▶│ Immich Server│
-│                 │     │               │     │              │
-│ Background      │     │ /api/assets/  │     │ /api/assets  │
-│ Upload Extension│     │ background    │     │              │
-│                 │     │               │     │              │
-│ Raw photo data  │     │ Convert to    │     │ Multipart    │
-│ + Headers       │     │ multipart     │     │ form-data    │
-└─────────────────┘     └───────────────┘     └──────────────┘
-```
+Uploads are written under `DATA_DIR/originals/YYYY/MM/`. Each asset has a JSON sidecar with capture metadata, checksums, and Immich forwarding status. Staged uploads use `DATA_DIR/.staging/` and are removed after a successful commit. Mount `DATA_DIR` on persistent storage.
 
-## Features
+The read-only archive API requires `Authorization: Bearer <STANDALONE_API_KEY>`:
 
-- **Background Upload Endpoint** (`/api/assets/background`): Converts raw photo data to Immich-compatible multipart format
-- **General Proxy**: All other API requests are proxied directly to Immich server
-- **Health Check** (`/health`): Simple health check endpoint
+- `GET /api/archive/assets?limit=200` lists assets and their forwarding status.
+- `GET /api/archive/assets/{id}` downloads an original.
+
+The endpoint is disabled in Immich mode unless `STANDALONE_API_KEY` is set.
 
 ## Configuration
 
-Configuration is done via environment variables:
+Copy `.env.example` to `.env` and set the standalone credentials and a random API key. Leave `IMMICH_SERVER_URL` empty for standalone mode.
 
-| Variable            | Default                 | Description                   |
-| ------------------- | ----------------------- | ----------------------------- |
-| `LISTEN_ADDR`       | `:8080`                 | Address and port to listen on |
-| `IMMICH_SERVER_URL` | `http://localhost:2283` | URL of the Immich server      |
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LISTEN_ADDR` | `:8080` | Address inside the container |
+| `DATA_DIR` | `./data` | Persistent originals and upload state |
+| `STANDALONE_API_KEY` | — | At least 32 characters; YAIIU's standalone access token and archive API token |
+| `STANDALONE_EMAIL` | — | Login email required when Immich is not configured |
+| `STANDALONE_PASSWORD` | — | Login password, at least 12 characters, required in standalone mode |
+| `STANDALONE_NAME` | `Photo Backup` | Display name returned to YAIIU |
+| `IMMICH_SERVER_URL` | empty | Immich origin; empty selects standalone mode |
+| `IMMICH_API_KEY` | empty | Optional server-side key for background forwarding and backlog delivery |
+| `MAX_UPLOAD_BYTES` | `107374182400` | Maximum file size, default 100 GiB |
 
-## Background Upload API
+The reverse proxy in front of this server must allow request bodies at least as large as `MAX_UPLOAD_BYTES`. For iPhone use, expose it over HTTPS. A local HTTP endpoint is useful for development on the Mac or Simulator.
 
-### Endpoint
+## Run locally with Docker Compose
 
-```
-POST /api/assets/background
-```
-
-On iOS 27, PhotoKit first sends an `OPTIONS` capability request. The proxy
-returns `501 Not Implemented` so PhotoKit uses its standard non-resumable upload
-path; resumable uploads are not currently supported.
-
-### Headers
-
-| Header               | Required | Description                                        |
-| -------------------- | -------- | -------------------------------------------------- |
-| `x-api-key`          | Yes      | Immich API key for authentication                  |
-| `X-Device-Asset-Id`  | No       | Unique identifier for the asset                    |
-| `X-Device-Id`        | No       | Device identifier (default: `ios-immich-uploader`) |
-| `X-File-Created-At`  | No       | ISO8601 timestamp of file creation                 |
-| `X-File-Modified-At` | No       | ISO8601 timestamp of file modification             |
-| `X-Is-Favorite`      | No       | Whether the asset is a favorite (default: `false`) |
-| `X-Filename`         | No       | Original filename of the asset                     |
-| `X-Content-Type`     | No       | MIME type of the asset                             |
-| `X-Timezone-Offset`  | No       | EXIF offset (`+08:00`) added only when an image lacks `OffsetTimeOriginal` |
-
-### Request Body
-
-Raw binary data of the photo/video file.
-
-### Response
-
-Returns the response from Immich server:
-
-```json
-{
-    "id": "ef96f635-61c7-4639-9e60-61a11c4bbfba",
-    "duplicate": false
-}
+```sh
+cp .env.example .env
+# Edit .env with STANDALONE_API_KEY, STANDALONE_EMAIL, and STANDALONE_PASSWORD.
+docker compose up -d --build
 ```
 
-## Running
+The server is available on `http://127.0.0.1:8090`. Compose stores the archive in `./data`.
 
-### Using Go
+To connect this proxy container to Immich running on the same Mac, set:
 
-```bash
-cd immich-proxy
-export IMMICH_SERVER_URL=http://your-immich-server:2283
-go run .
+```dotenv
+IMMICH_SERVER_URL=http://host.docker.internal:2284
+IMMICH_API_KEY=your-immich-upload-key
 ```
 
-ExifTool is optional; when it is missing, the proxy logs a warning and forwards uploads with their original metadata instead of failing them.
+Then rebuild/recreate the proxy with `docker compose up -d --build`. For two services on the same Compose network, use `http://immich-server:2283` instead. When Immich is configured, YAIIU should log in using the Immich account; the standalone email/password are ignored.
 
-```bash
-# macOS
-brew install exiftool
+## Development build
 
-# Debian/Ubuntu
-sudo apt install libimage-exiftool-perl
-```
+Build the Go proxy with `go build ./...` from this directory. Build the YAIIU Debug app from the repository root with Xcode. The PhotoKit background upload extension requires a physical device for end-to-end upload debugging.
 
+The current extension `Info.plist` has `BackgroundUploadURLBase` set to `https://github.com`. PhotoKit may reject a custom server URL until that extension setting is configured for the development server's HTTPS origin; the app's Swift client does not need to change.
 
-### Using Docker
+The Helm chart also mounts the archive to a persistent volume claim by default (100 GiB, configurable). Provide standalone credentials and an optional `IMMICH_API_KEY` through `extraEnv` using Kubernetes Secrets rather than committing secrets in `values.yaml`.
 
-```bash
-docker run -p 8080:8080 \
-  -e IMMICH_SERVER_URL=http://your-immich-server:2283 \
-  fawenyo/immich-proxy:latest
-```
+## Existing proxy behavior
 
-Or build your own:
+- `GET /health` returns the status and time YAIIU expects.
+- `OPTIONS /api/assets/background` returns `501` so PhotoKit selects its non-resumable upload path.
+- `POST /api/assets/background` accepts raw PhotoKit bytes and their metadata headers.
+- `POST /api/assets` accepts YAIIU's multipart foreground upload.
+- Other API requests are proxied to Immich when `IMMICH_SERVER_URL` is set.
 
-```bash
-cd immich-proxy
-docker build -t immich-proxy .
-docker run -p 8080:8080 \
-  -e IMMICH_SERVER_URL=http://your-immich-server:2283 \
-  immich-proxy
-```
-
-### Using Helm (Kubernetes)
-
-```bash
-# Add values override (optional)
-cat > my-values.yaml << EOF
-config:
-  immichServerURL: "http://immich-server:2283"
-
-ingress:
-  enabled: true
-  className: nginx
-  hosts:
-    - host: immich-proxy.example.com
-      paths:
-        - path: /
-          pathType: Prefix
-EOF
-
-# Install / Upgrade the chart
-helm upgrade -i immich-proxy ./deployment/immich-proxy -f my-values.yaml
-
-# Or install / upgrade with inline values
-helm upgrade -i immich-proxy ./deployment/immich-proxy \
-  --set config.immichServerURL=http://immich-server:2283
-```
+The archive stores received bytes unchanged. If an incoming background image needs the timezone offset added for Immich, ExifTool writes a temporary forwarding copy; the archived original stays unchanged.

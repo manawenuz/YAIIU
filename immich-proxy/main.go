@@ -1,110 +1,76 @@
 package main
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
-	"immich-proxy/handlers"
-	"immich-proxy/proxy"
+	"immich-proxy/internal/photobackup"
 )
 
 func main() {
-	// Load configuration from environment variables
-	config := loadConfig()
+	cfg, err := photobackup.ConfigFromEnv()
+	if err != nil {
+		log.Fatalf("Invalid configuration: %v", err)
+	}
+	store, err := photobackup.NewStore(cfg.DataDir, cfg.MaxUploadBytes)
+	if err != nil {
+		log.Fatalf("Could not initialize photo archive: %v", err)
+	}
+	app, err := newPhotoBackupServer(cfg, store)
+	if err != nil {
+		log.Fatalf("Could not initialize server: %v", err)
+	}
+	app.startForwardWorker()
 
-	log.Printf("Starting Immich Proxy Server...")
-	log.Printf("Listening on: %s", config.ListenAddr)
-	log.Printf("Immich Server: %s", config.ImmichServerURL)
+	mode := "standalone archive"
+	if cfg.ImmichServerURL != "" {
+		mode = "archive + Immich forwarding"
+	}
+	log.Printf("Starting YAIIU photo server in %s mode", mode)
+	log.Printf("Listening on %s; archive directory: %s", cfg.ListenAddr, cfg.DataDir)
 
-	// Create reverse proxy for general API calls
-	reverseProxy := proxy.NewReverseProxy(config.ImmichServerURL)
-
-	// Create multiplexer
-	mux := http.NewServeMux()
-
-	// Health check endpoint
-	mux.HandleFunc("/health", handlers.HealthHandler)
-
-	// Background upload endpoint - converts raw photo data to multipart form-data
-	mux.HandleFunc("/api/assets/background", handlers.BackgroundUploadHandler(config.ImmichServerURL))
-
-	// All other requests are proxied directly to Immich server
-	mux.HandleFunc("/", reverseProxy.Handler())
-
-	// Start server
 	server := &http.Server{
-		Addr:    config.ListenAddr,
-		Handler: logMiddleware(mux),
+		Addr:              cfg.ListenAddr,
+		Handler:           logMiddleware(app),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
 	}
-
-	log.Fatal(server.ListenAndServe())
-}
-
-// Config holds the server configuration
-type Config struct {
-	ListenAddr      string
-	ImmichServerURL string
-}
-
-// loadConfig loads configuration from environment variables
-func loadConfig() *Config {
-	listenAddr := os.Getenv("LISTEN_ADDR")
-	if listenAddr == "" {
-		listenAddr = ":8080"
+	if cfg.TLSCertFile != "" {
+		err = server.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile)
+	} else {
+		err = server.ListenAndServe()
 	}
-
-	immichServerURL := os.Getenv("IMMICH_SERVER_URL")
-	if immichServerURL == "" {
-		immichServerURL = "http://localhost:2283"
-	}
-
-	return &Config{
-		ListenAddr:      listenAddr,
-		ImmichServerURL: immichServerURL,
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("Server stopped: %v", err)
+		os.Exit(1)
 	}
 }
 
-// logMiddleware logs all incoming requests except health checks
 func logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip logging for health check endpoint to reduce log noise
-		if r.URL.Path != "/health" {
-			clientIP := GetClientIP(r)
-			log.Printf("[%s] %s %s", r.Method, r.URL.Path, clientIP)
+		if r.URL.Path != "/health" && r.URL.Path != "/healthz" {
+			log.Printf("[%s] %s %s", GetClientIP(r), r.Method, r.URL.Path)
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// GetClientIP extracts the real client IP from the request.
-// It checks X-Forwarded-For and X-Real-IP headers first (for proxy scenarios),
-// then falls back to RemoteAddr.
 func GetClientIP(r *http.Request) string {
-	// Check X-Forwarded-For header first (may contain multiple IPs)
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// X-Forwarded-For can contain multiple IPs: client, proxy1, proxy2...
-		// The first IP is typically the original client
-		ips := strings.Split(xff, ",")
-		if len(ips) > 0 {
-			clientIP := strings.TrimSpace(ips[0])
-			if clientIP != "" {
-				return clientIP
-			}
+		if clientIP := strings.TrimSpace(strings.Split(xff, ",")[0]); clientIP != "" {
+			return clientIP
 		}
 	}
-
-	// Check X-Real-IP header (set by NGINX)
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
+	if value := r.Header.Get("X-Real-IP"); value != "" {
+		return value
 	}
-
-	// Check CF-Connecting-IP header (Cloudflare)
-	if cfIP := r.Header.Get("CF-Connecting-IP"); cfIP != "" {
-		return cfIP
+	if value := r.Header.Get("CF-Connecting-IP"); value != "" {
+		return value
 	}
-
-	// Fall back to RemoteAddr
 	return r.RemoteAddr
 }

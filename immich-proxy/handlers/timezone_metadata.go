@@ -70,6 +70,52 @@ func addTimezoneOffsetIfMissing(photoData []byte, filename, offset string) ([]by
 	return normalized, true, nil
 }
 
+// AddTimezoneOffsetFileIfMissing applies the same lossless EXIF update as
+// addTimezoneOffsetIfMissing without loading the image into memory. The caller
+// owns and must remove the returned path when changed is true.
+func AddTimezoneOffsetFileIfMissing(sourcePath, filename, offset string) (string, bool, error) {
+	if !exifOffsetPattern.MatchString(offset) || !canRewriteTimezone(filename) {
+		return sourcePath, false, nil
+	}
+	if _, err := exec.LookPath("exiftool"); err != nil {
+		return sourcePath, false, fmt.Errorf("exiftool not available: %w", err)
+	}
+	output, err := os.CreateTemp("", "immich-proxy-output-*")
+	if err != nil {
+		return sourcePath, false, fmt.Errorf("create metadata output: %w", err)
+	}
+	outputPath := output.Name()
+	if err := output.Close(); err != nil {
+		_ = os.Remove(outputPath)
+		return sourcePath, false, fmt.Errorf("close metadata output: %w", err)
+	}
+	if err := os.Remove(outputPath); err != nil {
+		return sourcePath, false, fmt.Errorf("prepare metadata output: %w", err)
+	}
+	cmd := exec.Command(
+		"exiftool",
+		"-q", "-q",
+		"-if", "not defined $OffsetTimeOriginal or $OffsetTimeOriginal eq ''",
+		"-OffsetTimeOriginal="+offset,
+		"-o", outputPath,
+		sourcePath,
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		_ = os.Remove(outputPath)
+		if exitError, ok := err.(*exec.ExitError); ok && exitError.ExitCode() == 2 && strings.TrimSpace(stderr.String()) == "" {
+			return sourcePath, false, nil
+		}
+		return sourcePath, false, fmt.Errorf("write OffsetTimeOriginal: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	if err := os.Chmod(outputPath, 0o600); err != nil {
+		_ = os.Remove(outputPath)
+		return sourcePath, false, fmt.Errorf("secure metadata output: %w", err)
+	}
+	return outputPath, true, nil
+}
+
 // Restrict metadata-only rewrites to formats validated for this upload path.
 // Camera RAW and HEIF (including files already containing correct GPS/EXIF)
 // must always be sent to Immich without changing their bytes.
